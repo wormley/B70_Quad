@@ -7,7 +7,7 @@ FROM docker.io/vllm/vllm-openai-xpu@sha256:e4446310b1d30015e8fdc1a0a2ef1669ac6be
 COPY driver-debs/ /driver-debs/
 COPY driver-packages.lock.json /driver-packages.lock.json
 COPY install_driver.py /install_driver.py
-RUN python3 /install_driver.py
+RUN python3 /install_driver.py /driver-debs /driver-packages.lock.json
 
 COPY base-image/fs/vllm/ /opt/venv/lib/python3.12/site-packages/vllm/
 # The official image keeps a source tree at /workspace/vllm that shadows
