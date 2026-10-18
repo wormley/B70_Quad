@@ -4,6 +4,7 @@
 #   bash build.sh [TAG]        # or: IMAGE=localhost/qfn38:dev bash build.sh
 #   Default tag: localhost/qfn38-fp8-4xb70:latest (a positional TAG overrides
 #   the IMAGE env var). The intermediate base image is <TAG-root>:base.
+#   bash build.sh clean        # remove all build artifacts (repo prep)
 #
 # Stages:
 #   1. base image   — official vLLM 0.30.0 XPU image + python tree overlay
@@ -27,7 +28,24 @@ CONTAINER_ENGINE="${CONTAINER_ENGINE:-podman}"
 DEVEL_IMAGE="docker.io/intel/deep-learning-essentials:2026.1.2-devel-ubuntu24.04"
 
 cd "$SCRIPT_DIR"
+
+# Repo prep: remove everything the build creates so only source remains
+# (driver debs are re-fetched on the next build; images are not touched).
+if [ "${1:-}" = "clean" ]; then
+  echo "cleaning build artifacts..."
+  rm -rf build_out venv
+  find . -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
+  rm -f driver-debs/*.deb
+  echo "clean done: build_out/, venv/, __pycache__/, driver-debs/*.deb removed"
+  exit 0
+fi
+
 mkdir -p build_out
+
+echo "=========================================================="
+echo "Stage 0/3: driver debs (fetch if missing, hash-verify all)"
+echo "=========================================================="
+python3 scripts/fetch_debs.py
 
 echo "=========================================================="
 echo "Stage 1/3: base image (official vLLM 0.30.0 + python tree)"

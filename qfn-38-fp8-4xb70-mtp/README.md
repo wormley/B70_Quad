@@ -15,14 +15,24 @@ XPU image, applies source patches, and compiles the kernels from git.
 - ~40 GB free disk for the build; ~60 GB RAM recommended at 262K context
 - The model checkpoint **Qwen3.8-Flash-Next-FP8** (official release; contains
   the MTP1 module — no separate draft model needed)
-- Build time: ~40 min (kernel compile dominates; capped at 16 parallel jobs —
-  higher OOMs on 128 GB hosts)
+- Build time: ~20 min (attention-kernel templates are pruned to the subset
+  this model can reach; `KERNEL_CONF=full bash build.sh` restores the
+  unpruned ~40-60 min build). Capped at 16 parallel jobs — higher OOMs on
+  128 GB hosts.
 
 ## Build Instructions
 
 ```bash
 bash build.sh              # produces localhost/qfn38-fp8-4xb70:latest
 ```
+
+Driver debs need not be present: stage 0 downloads any missing ones from the
+pinned upstream URLs and hash-verifies everything. Carried files are used
+as-is (offline-friendly).
+
+`bash build.sh clean` removes all build artifacts (`build_out/`, `venv/`,
+`__pycache__/`, fetched `driver-debs/*.deb`) so the directory is pure source
+for committing; everything is regenerated or re-fetched on the next build.
 
 Three stages, all from source:
 

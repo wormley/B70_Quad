@@ -47,6 +47,10 @@ ldconfig
 command -v ocloc >/dev/null && echo "ocloc OK"
 
 echo "=== [4/6] clone + patch vllm-xpu-kernels v0.1.14 ==="
+# Kernel-config pruning: only instantiate the attention-kernel templates the
+# B70 serving stack can reach (head_dim=256, qgroup 3/6/12, all page sizes).
+# KERNEL_CONF=full restores the unpruned build (all ~3k template files).
+KERNEL_CONF=${KERNEL_CONF:-qfn38}
 mkdir -p /workspace && cd /workspace
 if [ ! -d vllm-xpu-kernels ]; then
   git clone -q --depth 1 --branch v0.1.14 \
@@ -57,8 +61,14 @@ git log -1 --format="source at %h %s"
 # the 7-site int64 cast (idempotent — VERIFYs after patching):
 python3 "$MOUNT"/scripts/patch_conv1d.py .
 
-echo "=== [5/6] wheel build (full: all kernel libs, defaults ON) ==="
+echo "=== [5/6] wheel build (kernel libs, defaults ON, pruned attn templates) ==="
 export MAX_JOBS="$NPROC"
+if [ "$KERNEL_CONF" = "full" ]; then
+  unset VLLM_PAGED_DECODE_CONFIG VLLM_CHUNK_PREFILL_CONFIG
+else
+  export VLLM_PAGED_DECODE_CONFIG="$MOUNT/scripts/kernel_configs/qfn38_paged_decode.conf"
+  export VLLM_CHUNK_PREFILL_CONFIG="$MOUNT/scripts/kernel_configs/qfn38_chunk_prefill.conf"
+fi
 "$PY" -m build --wheel --no-isolation --outdir "$OUT/wheel" .
 ls -la "$OUT"/wheel/*.whl
 

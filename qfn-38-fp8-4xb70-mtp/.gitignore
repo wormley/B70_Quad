@@ -1,0 +1,6 @@
+# hash-verified at build time (scripts/fetch_debs.py fetches these if absent)
+driver-debs/*.deb
+# build artifacts
+build_out/
+venv/
+__pycache__/
