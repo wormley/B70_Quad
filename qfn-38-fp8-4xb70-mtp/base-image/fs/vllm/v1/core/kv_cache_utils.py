@@ -1790,7 +1790,9 @@ def _get_packed_kv_cache_groups(
         vllm_config,
         kv_cache_spec,
         groups,
-        use_deepseek_v4_fallback=_is_deepseek_v4_eagle(vllm_config),
+        use_last_layer_fallback=(
+            _is_deepseek_v4_eagle(vllm_config) or _is_qwen4_exp_eagle(vllm_config)
+        ),
     )
     _warn_if_unannotated_eagle_mamba(vllm_config, groups)
     return groups
@@ -1806,11 +1808,34 @@ def _is_deepseek_v4_eagle(vllm_config: VllmConfig) -> bool:
     )
 
 
+# Draft checkpoints whose MTP block reuses the target's own decoder layer
+# carry no spec marker, so rule 1 below cannot see them. Their draft attention
+# layer is always the last registered layer, so rule 2 identifies their draft
+# group positionally. Qwen4ExpMTP is the verified case: its draft layer is
+# built as a full-attention ``Qwen4ExpDecoderLayer`` (models/qwen4_exp/*/mtp.py),
+# shares the target's full-attention KV group, and is registered after every
+# backbone layer. Without rule 2, the flag-all eagle fallback treats the
+# Mamba groups as draft groups and silently disables cross-request
+# prefix-cache reuse.
+_EAGLE_LAST_LAYER_DRAFT_ARCHITECTURES = frozenset({"Qwen4ExpMTP"})
+
+
+def _is_qwen4_exp_eagle(vllm_config: VllmConfig) -> bool:
+    spec_config = vllm_config.speculative_config
+    if spec_config is None or not spec_config.use_eagle():
+        return False
+    draft_model_config = getattr(spec_config, "draft_model_config", None)
+    if draft_model_config is None:
+        return False
+    architectures = getattr(draft_model_config, "architectures", None) or ()
+    return bool(_EAGLE_LAST_LAYER_DRAFT_ARCHITECTURES & set(architectures))
+
+
 def _annotate_eagle_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
     kv_cache_groups: list[KVCacheGroupSpec],
-    use_deepseek_v4_fallback: bool = False,
+    use_last_layer_fallback: bool = False,
 ) -> None:
     """Flag the KV cache groups that hold drafter attention layers.
 
@@ -1823,14 +1848,15 @@ def _annotate_eagle_groups(
        spec merging, wherever grouping happens to land. It is sufficient but
        not necessary: a drafter whose spec is indistinguishable from the
        target's cannot be found this way.
-    2. Model-scoped positional fallback for DeepseekV4, whose MTP block reuses
-       the target's own decoder layer and so carries no spec marker. Its draft
+    2. Model-scoped positional fallback for MTP drafts that reuse the target's
+       own decoder layer and so carry no spec marker (DeepseekV4 and
+       Qwen4ExpMTP; see ``_EAGLE_LAST_LAYER_DRAFT_ARCHITECTURES``). The draft
        attention layer is always the last registered layer, so flag whichever
        group holds it. This rule is only valid where the groups partition
        exactly the layers of ``kv_cache_spec``, which is true on the packed
        grouping path and not in general; other callers must leave
-       ``use_deepseek_v4_fallback`` False. The caller gates this fallback on
-       the configured model type.
+       ``use_last_layer_fallback`` False. The caller gates this fallback on
+       the draft/target model identity.
        FIXME(yifan): avoid/generalize this hacky check.
 
     Args:
@@ -1838,7 +1864,8 @@ def _annotate_eagle_groups(
         kv_cache_spec: The kv cache spec of each attention layer, in layer
             registration order. Only read by rule 2.
         kv_cache_groups: Groups to annotate in place.
-        use_deepseek_v4_fallback: Enable rule 2 for a DeepseekV4 packed group.
+        use_last_layer_fallback: Enable rule 2 for a packed group whose MTP
+            draft reuses the target's decoder layer (DeepseekV4, Qwen4ExpMTP).
     """
     spec_config = vllm_config.speculative_config
     if spec_config is None or not spec_config.use_eagle_block_drop():
@@ -1851,7 +1878,7 @@ def _annotate_eagle_groups(
         ):
             group.is_eagle_group = True
 
-    if not use_deepseek_v4_fallback:
+    if not use_last_layer_fallback:
         return
     last_layer = next(reversed(kv_cache_spec))
     for group in kv_cache_groups:

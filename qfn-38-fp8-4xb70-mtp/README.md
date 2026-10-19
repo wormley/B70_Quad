@@ -82,13 +82,49 @@ curl -s http://127.0.0.1:18100/v1/chat/completions -H "Authorization: Bearer abc
 # expect "391"
 ```
 
+## Correctness testing (small context)
+
+**No missing-space glitch reproduced:** an A/B battery (MTP1 on vs off, user
+profile incl. `VLLM_XPU_ENABLE_XPU_GRAPH=1`, reasoning/tool parsers) at ≤ 32K
+returned byte-perfect, correctly-spaced output for ~110 deterministic requests
+per leg; details in `SPACETEST-RESULTS.md`. Re-run it with
+`bash scripts/qfn38-spacetest.sh` (Apollo; evidence under
+`/home/llm/qwen38-tests/qfn38-spacetest/`).
+
+### Prefix caching with MTP (eagle-group fix + structural finding)
+
+Two separate findings, both A/B-verified (details in `EAGLEFIX-RESULTS.md`):
+
+1. **Annotation bug — fixed (#9).** With MTP on, vLLM used to flag every KV
+   cache group — including the 4 Mamba groups — as a draft group, silently
+   disabling cross-request prefix-cache reuse (0.0% hit rate) and logging
+   `no KV cache group could be identified as the draft model's`. The fix in
+   `base-image/fs/vllm/` removes the warning and mislabeling. Unit test:
+   `podman run --rm --entrypoint python3 <img> /opt/eaglefix/test_eagle_annotation.py`.
+2. **Structural: MTP and cross-request prefix reuse are mutually exclusive on
+   this hybrid model.** Even with the fix, hits stay 0 under MTP: the mandatory
+   eagle last-block drop always backs hits off below the nearest 832-token
+   mamba state boundary, and mamba partial-tail states are (correctly) not
+   registered under eagle — we verified empirically that bypassing the drop
+   (`disable_eagle_block_drop`) restores hits but **corrupts outputs**
+   (duplicated/wrong tokens on cached requests). No config fixes this safely;
+   upstream report material.
+
+Practical guidance: keep `--speculative-config` (MTP) for decode-bound
+serving; drop it for shared-prefix/multi-turn workloads — without MTP, prefix
+caching delivers 33–40% hit rates on repeated 1.2K-token prefixes (A/B
+verified, outputs exact). Exact-match note: `--prefix-cache-retention-interval
+832` and `--prefix-match-unit 64` were tested and do not help under MTP.
+
 Profile notes (each matters):
 
 - `--cpu-offload-gb 16` with MTP, or `14` without MTP: the KV-pool size band
   is load-bearing. Below ~6.5 GB of KV pool the scheduler fragments deep
   prefills and 262K requests slow down 4× (see Open Issues).
 - Prefix caching is ON by default and validated at 262K (requires the int64
-  kernel fix below).
+  kernel fix below). With MTP on, cross-request hits are structurally zero
+  (see the eagle-group note above); without MTP they work (33–40% observed
+  on shared prefixes).
 - For +10% decode add `VLLM_XPU_ENABLE_XPU_GRAPH=1` and remove
   `--enforce-eager` (graphs validated at TP=4, including with MTP).
 - The PLE table is served directly from the checkpoint safetensors via mmap
@@ -133,6 +169,7 @@ from graphs and MTP compose near-multiplicatively.
 | 6 | **int64 state-offset fix (the 4 GiB bug)**: 7 sites in vllm-xpu-kernels (`causal_conv1d.hpp`, `chunk_causal_conv1d_tiled_xe2.hpp`, `chunk_causal_conv1d_xe2.hpp`) computed conv/SSM state offsets as `id × stride` in **int32**, wrapping at 2^31 elements. With prefix caching ON the mamba conv-state pool is packed per KV block, so deep-context block ids cross the wrap → wild reads/writes → `-ENOENT` fault storms or silent corruption. This is why prefix caching could not be enabled at 262K. The conv kernels are header-only and compile into `_xpu_C.abi3.so`, so the fix requires the full kernels rebuild this script performs. | **ours** — patch in `scripts/patch_conv1d.py`; umbrella upstream issue [vllm-xpu-kernels #291](https://github.com/vllm-project/vllm-xpu-kernels/issues/291) ("Replace int with size_t"); **still unfixed in v0.1.15** |
 | 7 | `patchelf --set-rpath '$ORIGIN'` on the rebuilt `_xpu_C.abi3.so` — without it the image fails vLLM platform detection (`libgrouped_gemv_xe_default.so: cannot open shared object file` → "Failed to infer device type") | **ours** — build fix, applied automatically in `build.sh` |
 | 8 | MTP1: no code changes — the checkpoint ships the full MTP1 module and the tree resolves `qwen4_exp → qwen4_exp_mtp → Qwen4ExpMTP`; mamba/QSA state shapes already honor `num_speculative_tokens` | **upstream** |
+| 9 | **Qwen4ExpMTP eagle-group annotation (prefix-cache + MTP interaction)**: with `method=mtp` vLLM could not identify the draft model's KV cache group (the MTP draft layer reuses the target's full-attention `Qwen4ExpDecoderLayer`, so no spec marker and the positional fallback was gated to `deepseek_v4` only). The coordinator then flagged **every** group — including the 4 Mamba groups — as a draft group, whose widened lookup window mamba `align`-mode checkpointing cannot satisfy → cross-request prefix-cache reuse silently dropped to 0% (logged warning `no KV cache group could be identified as the draft model's`; confirmed 0.0% hit rate in serving logs). Fix: generalize the last-layer positional fallback to drafts whose architectures include `Qwen4ExpMTP` (`vllm/v1/core/kv_cache_utils.py`: `_is_qwen4_exp_eagle` + `_EAGLE_LAST_LAYER_DRAFT_ARCHITECTURES`). DeepseekV4 behavior unchanged. | **ours** — patch in `base-image/fs/vllm/`; regression test `scripts/test_eagle_annotation.py`; A/B evidence `EAGLEFIX-RESULTS.md` |
 
 ## Open Issues
 
@@ -155,3 +192,9 @@ from graphs and MTP compose near-multiplicatively.
    but this is off the upstream-supported path.
 5. The int32-offset bug remains in **upstream vllm-xpu-kernels v0.1.15** —
    rebuild from v0.1.14 + this patch until upstream merges the int64 fixes.
+6. **MTP × hybrid-model prefix reuse is structurally zero** (upstream,
+   v0.30.0 line): the eagle last-block drop always backs hits off below the
+   nearest mamba state boundary, and mamba partial-tail states are correctly
+   not registered under eagle — bypassing the drop restores hits but corrupts
+   outputs (A/B evidence in `EAGLEFIX-RESULTS.md`). Choose MTP **or**
+   prefix-cache-heavy serving per workload. Worth an upstream report.
